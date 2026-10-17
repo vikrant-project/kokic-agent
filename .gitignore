@@ -1,0 +1,27 @@
+# Private application state and credentials
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+*.sqlite*
+*.key
+*.pem
+*.p12
+*.log
+profiles/
+projects/
+uploads/
+conversations/
+.runtime/
+master.key
+server.lock
+# Local development
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+node_modules/
+.DS_Store
+# Local screenshots may contain private account information
+/*.png

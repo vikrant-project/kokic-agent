@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+dbus-next
+cryptography
+httpx
+
+pypdf

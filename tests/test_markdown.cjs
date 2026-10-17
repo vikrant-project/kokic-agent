@@ -1,0 +1,13 @@
+const {render}=require('../web/markdown.js');
+const assert=require('node:assert/strict');
+const task={id:'task-1',path:'/home/test/work'};
+assert.match(render('### Built\n\n**Ready** and `code`\n\n1. First\n2. Second'),/<h3>Built<\/h3>.*<strong>Ready<\/strong>.*<ol><li>First<\/li><li>Second/s);
+assert.match(render('[`app.js`](file:///home/test/work/dist/app.js)',task),/data-path="dist\/app.js"/);
+assert.match(render('([`app.js`](file:///home/test/work/dist/app.js))',task),/data-path="dist\/app.js">app.js<\/button>\)/);
+assert.match(render('3. Third'),/<ol start="3">/);
+assert.doesNotMatch(render('[secret](file:///home/test/work/../secret)',task),/data-action/);
+assert.doesNotMatch(render('[bad](javascript:alert(1)) <img src=x onerror=alert(1)>'),/<img|href=|<script/);
+assert.match(render('```html\n<script>alert(1)</script>\n```'),/&lt;script&gt;/);
+assert.match(render('[docs](https://example.com)'),/rel="noopener noreferrer"/);
+assert.match(render('`<button>`'),/<code>&lt;button&gt;<\/code>/);
+console.log('Markdown rendering and unsafe-link checks passed.');

@@ -1,0 +1,2 @@
+-r requirements.lock
+secretstorage==3.5.0
