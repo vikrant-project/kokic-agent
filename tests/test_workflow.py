@@ -9,6 +9,34 @@ class WorkflowTests(unittest.TestCase):
     setUp=test_system.PortalTests.setUp
     tearDown=test_system.PortalTests.tearDown
     # Reuse the isolated database/client fixture, not the base test methods.
+    def test_plan_parser_handles_fences_prose_and_unrelated_braces(self):
+        value={'intent':'task','reply':'Plan ready','enhanced_prompt':'Read the supplied goals.md text and plan the work','steps':['Read brief'],'acceptance':[],'questions':[]}
+        response='A note {not JSON}.\n```json\n'+json.dumps(value)+'\n```\nAdditional note {also not JSON}'
+        self.assertEqual(W.parse_plan(response)['intent'],'task')
+        self.assertEqual(W.parse_plan(json.dumps({'intent':'chat','reply':'Hello'}))['reply'],'Hello')
+        for bad in ['I will read the file.',json.dumps({'intent':'task','enhanced_prompt':'Build','questions':'none'}),json.dumps({'intent':'chat','reply':''})]:
+            with self.assertRaises(W.PlanningFormatError):W.parse_plan(bad)
+
+    def test_planning_format_repair_is_automatic_and_bounded(self):
+        task={'id':'format-test','prompt':'Read goals.md'}
+        good={'intent':'task','enhanced_prompt':'Read attached goals','steps':[],'questions':[]}
+        with patch.object(W,'_response_once',side_effect=[W.PlanningFormatError('I need to read it'),good]) as run:
+            self.assertEqual(W.response_turn(task,{},self.project),good)
+            self.assertEqual(run.call_count,2);self.assertEqual(run.call_args.args[3],'I need to read it')
+        with patch.object(W,'_response_once',side_effect=W.PlanningFormatError('plain text')) as run:
+            with self.assertRaisesRegex(RuntimeError,'No build was started'):W.response_turn(task,{},self.project)
+            self.assertEqual(run.call_count,2)
+
+    def test_planner_uses_streamed_json_and_attachment_context_without_tools(self):
+        a=self.client.post('/api/accounts',json={'label':'Stream planner'}).json()
+        plan={'intent':'task','reply':'Plan ready','enhanced_prompt':'Summarize attached goals.md','steps':['Read supplied text'],'questions':[]}
+        fake=Path(self.temp.name)/'stream-planner'
+        fake.write_text('#!/usr/bin/env python3\nimport sys,json\np=json.loads(sys.stdin.readline())["message"]["content"]\nassert "The only goal is a local document" in p\nassert "do not call tools" in p\nprint(json.dumps({"event":"step_update","step_update":{"step_type":"agent_response","text_delta":'+repr(json.dumps(plan))+'}}))\nprint(json.dumps({"event":"result","result":{"status":"SUCCESS","response":""}}))\n');fake.chmod(0o700)
+        task={'id':'stream-test','prompt':'Read goals.md. Extracted text: The only goal is a local document'}
+        with patch.object(R,'AGY',fake),patch.object(R,'profile_env',return_value=dict(os.environ)):
+            value=W.response_turn(task,a,self.project)
+        self.assertEqual(value['enhanced_prompt'],plan['enhanced_prompt'])
+
     def test_chat_finishes_without_build_or_worktree(self):
         a=self.client.post('/api/accounts',json={'label':'Conversation'}).json()
         tid=self.client.post('/api/projects/'+self.project['id']+'/chat',json={'prompt':'hello'}).json()['task']
@@ -102,7 +130,7 @@ class WorkflowTests(unittest.TestCase):
         a=self.client.post('/api/accounts',json={'label':'Proposal runner'}).json()
         proposal=json.dumps({'summary':'Ready for review','files':[{'path':'dist/index.html','content':'<h1>A real preview file</h1>'}]})
         fake=Path(self.temp.name)/'proposal-cli'
-        fake.write_text('#!/usr/bin/env python3\nimport sys,json\nsys.stdin.readline()\nprint(json.dumps({"event":"result","result":{"status":"SUCCESS","response":'+repr(proposal)+'}}))\n');fake.chmod(0o700)
+        fake.write_text('#!/usr/bin/env python3\nimport sys,json\nassert "--dangerously-skip-permissions" in sys.argv, "Autonomous worker missing native permission flag"\nsys.stdin.readline()\nprint(json.dumps({"event":"result","result":{"status":"SUCCESS","response":'+repr(proposal)+'}}))\n');fake.chmod(0o700)
         tid=R.create_task(self.project,'Build website','Create a page',a['id'],mode='route');S.write("UPDATE tasks SET status='running' WHERE id=?",(tid,))
         plan={'intent':'task','reply':'Building now','enhanced_prompt':'Create a page','deliverable':'website','steps':['Create HTML'],'questions':[]}
         with patch.object(W,'response_turn',return_value=plan),patch.object(R,'AGY',fake),patch.object(R,'profile_env',return_value=dict(os.environ)):

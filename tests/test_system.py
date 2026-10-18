@@ -161,12 +161,13 @@ Refreshes in 20m
         S.write("UPDATE accounts SET status='connected' WHERE id=?",(a['id'],))
         fake=Path(self.temp.name)/'limited-cli'
         fake.write_text('#!/usr/bin/env python3\nimport sys\nsys.stdin.readline()\nprint("429 RESOURCE_EXHAUSTED; resets in 2h",file=sys.stderr)\nsys.exit(1)\n');fake.chmod(0o700)
-        tid=R.create_task(self.project,'Quota retry','test',a['id'],policy='fallback')
+        tid=R.create_task(self.project,'Quota retry','test',a['id'],policy='sequential')
         S.write("UPDATE tasks SET status='running' WHERE id=?",(tid,))
         with patch.object(R,'AGY',fake),patch.object(R,'profile_env',return_value=dict(os.environ)):
             R.run_task(S.one('SELECT * FROM tasks WHERE id=?',(tid,)),a)
         task=S.one('SELECT * FROM tasks WHERE id=?',(tid,));account=S.one('SELECT * FROM accounts WHERE id=?',(a['id'],))
         self.assertEqual(task['status'],'queued');self.assertEqual(task['account'],'')
+        self.assertIsNotNone(S.one('SELECT id FROM checkpoints WHERE task=?',(tid,)))
         self.assertEqual(account['status'],'limited');self.assertAlmostEqual(account['cooldown']-time.time(),7200,delta=3)
     def test_cancellation_survives_runner_exception(self):
         a=self.client.post('/api/accounts',json={'label':'Cancelled'}).json()

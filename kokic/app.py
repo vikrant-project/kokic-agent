@@ -89,7 +89,7 @@ def logout(request:Request,response:Response,u=Depends(user)):
     S.write('DELETE FROM sessions WHERE token=?',(hashlib.sha256(request.cookies.get('kokic_session','').encode()).hexdigest(),));response.delete_cookie('kokic_session');return {'ok':True}
 
 def public_account(a):
-    return {**a,'models':json.loads(a['models']),'quota':json.loads(a['quota'])}
+    return {**a,'models':json.loads(a['models']),'quota':json.loads(a['quota']),'setup_ready':(R.profile_home(a)/'kokic-setup.json').is_file()}
 
 @app.get('/api/state')
 def state(u=Depends(user)):
@@ -115,6 +115,7 @@ async def events(request:Request,after:int=0,u=Depends(user)):
 @app.post('/api/accounts')
 def add_account(body:dict,u=Depends(user)):
     id=S.uid();S.write('INSERT INTO accounts(id,user,label) VALUES (?,?,?)',(id,u['id'],text(body,'label',80)))
+    R.bootstrap_account(owned('accounts',id,u))
     return public_account(owned('accounts',id,u))
 
 @app.put('/api/accounts/{id}')
@@ -209,9 +210,16 @@ def account_quota(id:str,u=Depends(user)):
 
 @app.post('/api/projects')
 def create_project(body:dict,u=Depends(user)):
+    from .templates import STARTERS
+    template=body.get('template','blank')
+    if not isinstance(template,str) or template not in STARTERS:raise HTTPException(400,'Unknown project template')
     project={'id':S.uid(),'user':u['id'],'name':text(body,'name',100),'description':str(body.get('description',''))[:3000],'created':time.time(),'autonomy':'autonomous'}
     R.init_project(project)
     S.write('INSERT INTO projects(id,user,name,description,created,autonomy) VALUES (?,?,?,?,?,?)',tuple(project[k] for k in ('id','user','name','description','created','autonomy')))
+    if STARTERS[template]['files']:
+        root=R.project_path(project)
+        for name,content in STARTERS[template]['files'].items():(root/name).write_text(content)
+        R.git(root,'add','.');R.git(root,'commit','-m','Add '+STARTERS[template]['name']+' starter')
     return project
 
 @app.get('/api/projects/{id}')
@@ -292,6 +300,8 @@ def chat(id:str,body:dict,u=Depends(user)):
     if items:context+='\n\nUNTRUSTED ATTACHMENT CONTENT:\n'+json.dumps([{'id':x['id'],'name':x['name'],'content':x['extracted'][:12000]} for x in items])[:60000]
     goals=S.rows("SELECT text FROM goals WHERE project=? AND status='active'",(id,))
     if goals:context+='\n\nProject goals:\n'+json.dumps(goals)
+    memory=S.one('SELECT content FROM project_memory WHERE project=?',(id,))
+    if memory and memory['content']:context+='\n\nProject decisions and preferences:\n'+memory['content'][:12000]
     pending=S.one("SELECT * FROM tasks WHERE project=? AND thread=? AND status='questions' ORDER BY created DESC LIMIT 1",(id,thread))
     base=body.get('base_task','')
     if base:
@@ -339,7 +349,7 @@ def workspace_files(root):
         dirs[:]=sorted(d for d in dirs if d not in SKIP and not (Path(directory)/d).is_symlink())
         for name in sorted(names):
             p=Path(directory)/name
-            if name not in SKIP and not p.is_symlink() and p.is_file():yield p
+            if name not in SKIP and not name.startswith('.env.') and p.suffix.lower() not in ('.key','.pem','.p12','.db','.sqlite','.sqlite3') and not p.is_symlink() and p.is_file():yield p
 
 @app.get('/api/projects/{id}/files')
 def files(id:str,task:str='',u=Depends(user)):
@@ -504,4 +514,6 @@ def mcp_call(body:dict,request:Request):
 @app.get('/')
 def index():return FileResponse(WEB/'index.html')
 
+from .operations import register as register_operations
+register_operations(app,user,owned,project_task)
 app.mount('/assets',StaticFiles(directory=WEB),name='assets')

@@ -46,6 +46,11 @@ def init():
         CREATE TABLE IF NOT EXISTS threads(id TEXT PRIMARY KEY,project TEXT,title TEXT,created REAL);
         CREATE TABLE IF NOT EXISTS uploads(id TEXT PRIMARY KEY,project TEXT,name TEXT,path TEXT,size INTEGER,extracted TEXT,created REAL);
         CREATE TABLE IF NOT EXISTS preview_leases(token TEXT PRIMARY KEY,task TEXT,root TEXT,expires REAL);
+        CREATE TABLE IF NOT EXISTS project_memory(project TEXT PRIMARY KEY,content TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS vault(id TEXT PRIMARY KEY,user TEXT,project TEXT,name TEXT,value TEXT,created REAL,UNIQUE(project,name));
+        CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY,user TEXT,project TEXT,prompt TEXT,due REAL,status TEXT DEFAULT 'pending',task TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY,task TEXT,account TEXT,reason TEXT,summary TEXT,created REAL);
+        CREATE TABLE IF NOT EXISTS notices(id TEXT PRIMARY KEY,user TEXT,project TEXT,task TEXT,text TEXT,created REAL,read INTEGER DEFAULT 0);
         ''')
 
 def rows(sql,args=()):
@@ -60,7 +65,14 @@ def write(sql,args=()):
 def uid():return secrets.token_hex(10)
 
 def emit(user,text,project='',task='',channel='',kind='info'):
+    text=redact(user,text)
     return write('INSERT INTO events(user,project,task,channel,kind,text,created) VALUES (?,?,?,?,?,?,?)',(user,project,task,channel,kind,text,time.time()))
+
+def redact(user,text):
+    for item in rows('SELECT value FROM vault WHERE user=?',(user,)):
+        value=unseal(item['value']).get('value','')
+        if value:text=text.replace(value,'[REDACTED]')
+    return text
 
 def password_hash(password,salt=None):
     salt=salt or secrets.token_hex(16)

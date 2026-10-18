@@ -13,7 +13,7 @@
 
 *A local agent studio powered by your installed Antigravity CLI.*
 
-[Quick start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Security](#security-and-private-data) · [Contributing](CONTRIBUTING.md)
+[Quick start](#quick-start) · [Features](#features) · [Architecture](#architecture) · [Security](#security-and-private-data) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
@@ -122,7 +122,7 @@ flowchart LR
     I -->|Approved| J[Merge and download]
 ```
 
-Sequential mode serializes top-level tasks within a project. Parallel mode allows available accounts to work on separate requests. Available-account scheduling can retry on another account after an actual quota-exhaustion signal. Only one worker or interactive terminal uses an account at a time. Delegation is agent-driven and requires other connected accounts; a prompt does not automatically run on every account.
+Sequential mode serializes top-level tasks within a project. Parallel mode allows available accounts to work on separate requests. Every scheduling policy now requeues the task after an actual quota-exhaustion signal so another eligible account can resume; the default chat option is Auto handoff. Only one worker or interactive terminal uses an account at a time. Delegation is agent-driven and requires other connected accounts; a prompt does not automatically run on every account.
 
 ## Architecture
 
@@ -200,6 +200,7 @@ Tests cover authorization boundaries, attachment ownership, preview leases, path
 | Headless command denied | Check the project's execution mode and CLI permission support |
 | Quota says unknown | Native CLI may not report a recognized format; inspect account usage output |
 | Preview unavailable | A website task must produce a real `index.html` in its preview directory |
+| Invalid planning response | The planner accepts JSON inside Markdown/prose and attempts one automatic format correction. Retry older failed tasks after updating. |
 | Already running | Stop the existing server for the same `KOKIC_HOME` before restarting |
 
 ## Project status and credits
@@ -207,3 +208,27 @@ Tests cover authorization boundaries, attachment ownership, preview leases, path
 Kokic Agent is an evolving local workspace. Native CLI compatibility, integration behavior, and model availability depend on external software. It does not build every application format automatically or deploy websites to public hosting by default.
 
 Terminal rendering uses [xterm.js](https://github.com/xtermjs/xterm.js); its license is included in `web/vendor/LICENSE-xterm.txt`. Third-party Python packages retain their respective licenses. No license grant for the original Kokic source is asserted by this README; a project license has not yet been selected.
+
+## Local Control Center
+
+Each project now includes **Control center** with project memory, owner-scoped search, one-time schedules, encrypted project secrets, version history, in-app notifications, artifact downloads, explicit checks, independent reviews and source backups.
+
+- Quota errors requeue work under every scheduling policy; another eligible account resumes in the same worktree. No eligible account means the task waits.
+- Progress snapshots run every 60 seconds and after failures. Workers receive the latest checkpoint; the last 30 are retained per task. Abrupt shutdown can still lose the most recent unsaved work.
+- New accounts receive Kokic identity, bundled skills and private settings automatically. The native model catalog is synchronized after an idle connected account is detected. Provider authorization still requires the account owner.
+- Secrets are encrypted at rest and provided to build subprocesses as environment variables. Known plaintext values are redacted from captured output on a best-effort basis; encoded or transformed secrets cannot be reliably detected. Do not ask agents to print secrets or write them into source.
+- Encrypted backups contain main-branch source, project metadata and memory. They exclude provider accounts, secrets, sessions, databases and Git history. Restore creates new projects with command review enabled. Keep the passphrase separately; there is no recovery if it is lost.
+- Scheduled tasks run only while the local server is available and their project is unpaused. This is one-time scheduling, not recurrence.
+- Voice input depends on browser speech recognition support and may use the browser vendor's service. Review dictation before sending.
+
+The complete requested feature list and remaining production gates are tracked in [the production roadmap](docs/PRODUCTION-ROADMAP.md). This remains a local development release; the roadmap does not claim all 30 features are complete or production-certified.
+
+## Planning and uploaded briefs
+
+Attach a supported file such as `goals.md` directly in project chat. Its extracted text is included in the planning context, so the planner does not need permission to open the original upload path. Planning and casual chat keep tools blocked; implementation runs separately after a valid task plan is produced.
+
+The response parser accepts structured JSON surrounded by Markdown or explanatory text and validates its fields before using it. A malformed response triggers one automatic correction attempt. Persistent format failures, native CLI errors and provider restrictions are reported rather than treated as completed work. A valid conversational answer is not proof that a requested task has been implemented.
+
+### Current validation
+
+The current local verification includes **40 Python tests**, JavaScript syntax checks and Markdown-rendering checks. Test coverage includes account-profile onboarding, quota-error checkpoints, owner boundaries, encrypted source backup round trips, version restoration, structured-plan parsing and bounded format recovery. Native authentication, model availability, browser speech support and provider quotas remain environment-dependent.

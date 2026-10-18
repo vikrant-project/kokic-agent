@@ -76,6 +76,7 @@ def terminate(proc):
 class Console:
     def __init__(self,user,account,command=None,intent='login'):
         self.id=S.uid();self.user=user;self.account=account;self.intent=intent;self.text='';self.closed=False;self.autosent=False
+        bootstrap_account(account)
         env=profile_env(account);master,slave=pty.openpty();self.fd=master
         fcntl.ioctl(slave,termios.TIOCSWINSZ,struct.pack('HHHH',50,140,0,0))
         self.proc=subprocess.Popen(command or [str(AGY)],env=env,cwd=str(profile_home(account)),stdin=slave,stdout=slave,stderr=slave,start_new_session=True)
@@ -174,7 +175,24 @@ def available_accounts(user):
     busy={r['account'] for r in S.rows("SELECT account FROM tasks WHERE status='running'")}
     busy|={c.account['id'] for c in CONSOLES.values() if not c.closed}
     busy|=QUOTA_JOBS
-    return [a for a in S.rows("SELECT * FROM accounts WHERE user=? AND status='connected' ORDER BY checked DESC",(user,)) if a['id'] not in busy and a['cooldown']<=time.time() and quota_allows(a)]
+    accounts=[a for a in S.rows("SELECT * FROM accounts WHERE user=? AND status='connected' ORDER BY checked DESC",(user,)) if a['id'] not in busy and a['cooldown']<=time.time() and quota_allows(a)]
+    def remaining(a):
+        group='gemini' if a['model'].startswith('gemini-') else 'claude_gpt'
+        quota=json.loads(a['quota']).get(group,{})
+        return quota.get('remaining_pct',-1)
+    return sorted(accounts,key=remaining,reverse=True)
+
+def bootstrap_account(account):
+    """Idempotent local onboarding; no provider authorization or global profile changes."""
+    from .workflow import IDENTITY
+    home=profile_home(account);home.mkdir(parents=True,exist_ok=True,mode=0o700)
+    config=home/'.gemini/config'
+    for skill in (SOURCE.parent/'skills').glob('*/SKILL.md'):
+        target=config/'skills'/skill.parent.name/'SKILL.md';target.parent.mkdir(parents=True,exist_ok=True);target.write_text(skill.read_text())
+    rule=config/'rules/kokic-identity.md';rule.parent.mkdir(parents=True,exist_ok=True);rule.write_text(IDENTITY)
+    settings=home/'.gemini/antigravity-cli/settings.json';settings.parent.mkdir(parents=True,exist_ok=True)
+    if not settings.exists():settings.write_text(json.dumps({'permissions':{'allow':[]}}));settings.chmod(0o600)
+    (home/'kokic-setup.json').write_text(json.dumps({'version':1,'skills':True,'identity':True,'worker_permissions':'project execution mode','provider_auth':'user required'}))
 
 def quota_allows(account):
     group='gemini' if account['model'].startswith('gemini-') else 'claude_gpt'
@@ -183,7 +201,7 @@ def quota_allows(account):
     exhausted=[w for w in value.get('windows',{}).values() if w['remaining_pct']<=0]
     return bool(exhausted) and all(w.get('reset_at') is not None and w['reset_at']<=time.time() for w in exhausted)
 
-def create_task(project,title,prompt,account='',role='',parent='',policy='sequential',thread='main',mode='build',attachments=None,base_task=''):
+def create_task(project,title,prompt,account='',role='',parent='',policy='fallback',thread='main',mode='build',attachments=None,base_task=''):
     if len(prompt)>200000:raise ValueError('Task instructions exceed 200000 characters')
     tid=S.uid();now=time.time()
     S.write('INSERT INTO tasks(id,project,parent,title,prompt,account,role,created,updated,policy,thread,mode,phase,attachments,base_task) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(tid,project['id'],parent,title[:150],prompt,account,role,now,now,policy,thread,mode,'understanding' if mode=='route' else 'building',json.dumps(attachments or []),base_task))
@@ -191,6 +209,7 @@ def create_task(project,title,prompt,account='',role='',parent='',policy='sequen
     return tid
 
 def configure_profile(account,task,project):
+    bootstrap_account(account)
     from .workflow import IDENTITY
     home=profile_home(account);config=home/'.gemini/config';config.mkdir(parents=True,exist_ok=True)
     settings=home/'.gemini/antigravity-cli/settings.json';settings.parent.mkdir(parents=True,exist_ok=True)
@@ -236,11 +255,14 @@ def configure_profile(account,task,project):
     return role['model'] if role and role['model'] else account['model']
 
 def run_task(task,account):
+    checkpoint_stop=threading.Event();checkpoint_worker=None
     project=S.one('SELECT * FROM projects WHERE id=?',(task['project'],));proc=None;stderr_worker=None;timer=None;last_output='';result='';success=False;errors=deque(maxlen=40);response_parts=[]
     try:
         from . import workflow as W
         if W.prepare(task,account,project):return
         env=profile_env(account);model=configure_profile(account,task,project)
+        from . import operations as O
+        env.update(O.task_secrets(project))
         path=S.ROOT/'projects'/project['id']/'worktrees'/task['id'];branch='task/'+task['id']
         with MUTEX:
             base=S.one('SELECT branch FROM tasks WHERE id=? AND project=?',(task.get('base_task',''),project['id']))
@@ -265,8 +287,16 @@ def run_task(task,account):
           'You may use Kokic MCP tools to delegate independent subtasks to OTHER accounts, inspect their results, and merge their completed branches into this worktree. '
           'Do not delegate to your own account while you are waiting for a child task. If only one account is connected, do the task yourself. '
           'Verify the result and summarize actual checks and limitations.\nYour account (only for excluding yourself from delegation): '+account['id']+'\nConnected account list: '+json.dumps(team)+'\n\nIMPLEMENT THIS REQUEST:\n'+task['prompt'])
+        checkpoint=S.one('SELECT summary FROM checkpoints WHERE task=? ORDER BY created DESC LIMIT 1',(task['id'],))
+        if checkpoint:prompt+='\n\nRESUME FROM CHECKPOINT (inspect actual files before changing them):\n'+checkpoint['summary']
         proc=subprocess.Popen(command,cwd=str(path),env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,encoding='utf-8',errors='replace',start_new_session=True)
         RUNNING[task['id']]=proc
+        def periodic_checkpoint():
+            while not checkpoint_stop.wait(60):
+                if proc.poll() is not None:return
+                try:O.checkpoint(project,task,account,'Periodic progress snapshot')
+                except Exception as exc:S.emit(project['user'],'Checkpoint unavailable: '+type(exc).__name__,project=project['id'],task=task['id'],kind='info')
+        checkpoint_worker=threading.Thread(target=periodic_checkpoint,daemon=True);checkpoint_worker.start()
         def stderr():
             for line in proc.stderr:
                 errors.append(line[-2000:]);S.emit(project['user'],line,project=project['id'],task=task['id'],kind='stderr')
@@ -302,21 +332,29 @@ def run_task(task,account):
             raise RuntimeError('The CLI returned text but did not create a website preview build. File contents in a chat reply are not saved deliverables. Inspect the terminal and retry.')
         if task.get('mode')=='route':
             with (path/'WORK.md').open('a') as log:log.write('\n\n## Agent report for review\n\n'+result+'\n\nStatus: awaiting user review.\n')
+        result=S.redact(project['user'],result)
         git(path,'add','-A');git(path,'commit','--allow-empty','-m','Kokic task '+task['id'])
         commit=git(path,'rev-parse','HEAD').strip()
         S.write("UPDATE tasks SET status='review',phase='review',result=?,commit_hash=?,updated=?,token='' WHERE id=?",(result,commit,time.time(),task['id']))
         S.write('INSERT INTO messages(project,role,content,task,created,thread) VALUES (?,?,?,?,?,?)',(project['id'],'assistant',result,task['id'],time.time(),task.get('thread','main')))
         S.emit(project['user'],'Ready for review: '+task['title'],project=project['id'],task=task['id'],kind='task')
+        O.notice(project,task,'Ready for review: '+task['title'])
     except Exception as exc:
         if S.one('SELECT status FROM tasks WHERE id=?',(task['id'],))['status']=='cancelled':return
         error=str(exc)[:3000];limited=bool(re.search(r'RESOURCE_EXHAUSTED|quota.{0,30}exceed|rate.limit|429',error,re.I))
         if limited:
             reset=reported_reset(error)
             S.write("UPDATE accounts SET status='limited',error=?,cooldown=? WHERE id=?",(error,reset or 0,account['id']))
-        state='queued' if limited and task['policy']=='fallback' else 'failed'
-        S.write('UPDATE tasks SET status=?,phase=?,error=?,updated=?,token=?,account=? WHERE id=?',(state,'understanding' if state=='queued' else 'failed',error,time.time(),'', '' if state=='queued' else account['id'],task['id']))
+        from . import operations as O
+        O.checkpoint(project,task,account,error)
+        state='queued' if limited else 'failed'
+        error=S.redact(project['user'],error)
+        S.write('UPDATE tasks SET status=?,phase=?,error=?,updated=?,token=?,account=? WHERE id=?',(state,'failed',error,time.time(),'', '' if state=='queued' else account['id'],task['id']))
         S.emit(project['user'],error,project=project['id'],task=task['id'],kind='error')
+        O.notice(project,task,'Account limit reached; saved progress and waiting for an eligible account.' if limited else 'Task failed: '+error[:300])
     finally:
+        checkpoint_stop.set()
+        if checkpoint_worker:checkpoint_worker.join(timeout=2)
         if timer:timer.cancel()
         if proc:
             terminate(proc)
@@ -331,8 +369,11 @@ def scheduler():
     while not STOP.wait(1):
         try:
             with MUTEX:
+                from .operations import dispatch_schedules
+                dispatch_schedules()
                 S.write("UPDATE accounts SET status='connected',cooldown=0,error='' WHERE status='limited' AND cooldown>0 AND cooldown<=?",(time.time(),))
                 for task in S.rows("SELECT t.* FROM tasks t JOIN projects p ON p.id=t.project WHERE t.status='queued' AND p.paused=0 ORDER BY t.created"):
+                    if task['id'] in RUNNING:continue
                     project=S.one('SELECT * FROM projects WHERE id=?',(task['project'],))
                     if task['policy']!='parallel' and S.one("SELECT id FROM tasks WHERE project=? AND status='running' AND parent=''",(project['id'],)) and not task['parent']:continue
                     accounts=available_accounts(project['user'])
@@ -345,6 +386,7 @@ def scheduler():
 
 def start():
     STOP.clear()
+    for account in S.rows('SELECT * FROM accounts'):bootstrap_account(account)
     S.write("UPDATE tasks SET status='failed',token='',error='Server restarted during execution; retry explicitly' WHERE status='running'")
     threading.Thread(target=scheduler,daemon=True).start()
     threading.Thread(target=quota_scheduler,daemon=True).start()
@@ -375,8 +417,26 @@ def refresh_quota(account):
 
 def quota_scheduler():
     while not STOP.wait(5):
+        for account in S.rows("SELECT * FROM accounts WHERE status='connected' AND models='[]' AND checked<?",(time.time()-60,)):
+            sync_models(account)
         for account in S.rows("SELECT * FROM accounts WHERE status IN ('connected','limited') AND quota_checked<?",(time.time()-300,)):
             refresh_quota(account)
+
+def sync_models(account):
+    with MUTEX:
+        if account['id'] in QUOTA_JOBS or S.one("SELECT id FROM tasks WHERE account=? AND status='running'",(account['id'],)) or any(c.account['id']==account['id'] and not c.closed for c in CONSOLES.values()):return False
+        QUOTA_JOBS.add(account['id'])
+    def worker():
+        try:
+            result=subprocess.run([str(AGY),'models'],env=profile_env(account),cwd=profile_home(account),capture_output=True,text=True,timeout=30)
+            models=[{'id':line.split('\t',1)[0].strip(),'name':line.split('\t',1)[1].strip()} for line in result.stdout.splitlines() if '\t' in line and line.startswith(('gemini-','claude-','gpt-'))]
+            if result.returncode or not models:raise RuntimeError('No model catalog returned; check account sign-in')
+            S.write("UPDATE accounts SET models=?,checked=?,error='' WHERE id=?",(json.dumps(models),time.time(),account['id']))
+            S.emit(account['user'],'Account setup: native model catalog synchronized',kind='account')
+        except Exception as exc:S.write('UPDATE accounts SET checked=?,error=? WHERE id=?',(time.time(),str(exc)[:500],account['id']))
+        finally:
+            with MUTEX:QUOTA_JOBS.discard(account['id'])
+    threading.Thread(target=worker,daemon=True).start();return True
 
 def shutdown():
     STOP.set()
